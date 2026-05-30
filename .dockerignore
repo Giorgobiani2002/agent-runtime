@@ -1,0 +1,16 @@
+.git
+.gitignore
+.env
+.env.local
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+node_modules/
+*.log
+smoke_phase_j.py
+test_agent_logic.py
