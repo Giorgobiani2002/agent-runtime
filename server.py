@@ -31,6 +31,26 @@ from typing import Dict, List, Optional
 from fastapi import FastAPI, HTTPException, Header
 from pydantic import BaseModel, Field
 
+# Sentry — must init BEFORE FastAPI app is created so middleware wires up.
+# No-op when SENTRY_DSN is unset.
+SENTRY_DSN = os.environ.get("SENTRY_DSN", "")
+if SENTRY_DSN:
+    import sentry_sdk
+    from sentry_sdk.integrations.fastapi import FastApiIntegration
+    sentry_sdk.init(
+        dsn=SENTRY_DSN,
+        environment=os.environ.get("RAILWAY_ENVIRONMENT_NAME", os.environ.get("ENV", "development")),
+        release=os.environ.get("RAILWAY_DEPLOYMENT_ID"),
+        traces_sample_rate=float(os.environ.get("SENTRY_TRACES_SAMPLE_RATE", "0.1")),
+        integrations=[FastApiIntegration()],
+        # Don't capture request bodies — they contain tenant data (login
+        # credentials, tax payloads) we never want in the error tracker.
+        send_default_pii=False,
+    )
+    print(f"[sentry] initialised (env={os.environ.get('RAILWAY_ENVIRONMENT_NAME', '?')})")
+else:
+    print("[sentry] SENTRY_DSN not set — error reporting disabled")
+
 ROOT = Path(__file__).resolve().parent
 MAIN_PY = str(ROOT / "main.py")
 PYTHON_BIN = sys.executable
