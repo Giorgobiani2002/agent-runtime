@@ -70,6 +70,11 @@ for _env_candidate in [
 # ── Shared HTTP client (connection reuse across backend API calls) ────────────
 _shared_http: httpx.AsyncClient | None = None
 
+# The final result text from the most recent run_agent() call, captured so
+# main() can post an autonomous-task callback (receipt parsing) without
+# changing run_agent()'s return signature.
+_LAST_FINAL_RESULT: str | None = None
+
 
 def _backend_auth_headers() -> dict:
     """
@@ -5840,6 +5845,9 @@ async def run_agent(
         # has_errors() catches consecutive LLM failures, max-step exhaustion, etc.
         succeeded = history.is_successful() is True and not history.has_errors()
         final = history.final_result()
+        # Stash for the autonomous-task callback in main().
+        global _LAST_FINAL_RESULT
+        _LAST_FINAL_RESULT = final if isinstance(final, str) else None
         completion_state = _default_completion_state(safety_mode) if succeeded else COMPLETION_FAILED
         history_errors = history.errors() or []
         session_broken = any(
@@ -6303,7 +6311,54 @@ def main():
             mode=args.mode,
         )
     )
+
+    # Autonomous-task callback: when this run was dispatched for a
+    # declaration in free mode (AGENT_CORRELATION_ID set + declaration_id
+    # in the data), tell agent-backend the outcome so the declaration's
+    # status flips without polling. Best-effort — never change the exit
+    # code over a callback failure.
+    correlation_id = os.environ.get("AGENT_CORRELATION_ID", "").strip()
+    declaration_id = str(user_data.get("declaration_id") or "").strip()
+    if correlation_id and declaration_id:
+        try:
+            asyncio.run(
+                _post_task_callback(
+                    declaration_id=declaration_id,
+                    success=success,
+                    final_text=_LAST_FINAL_RESULT,
+                )
+            )
+        except Exception as exc:  # noqa: BLE001
+            _emit("warn", f"task callback failed: {exc}")
+
     sys.exit(0 if success else 1)
+
+
+def _parse_receipt(final_text: str | None) -> str | None:
+    """Pull a `receipt=<value>` token out of the agent's final answer.
+    The autonomous VAT prompt instructs the agent to end with that line."""
+    if not final_text:
+        return None
+    import re
+
+    m = re.search(r"receipt\s*=\s*([^\s,;]+)", final_text, re.IGNORECASE)
+    return m.group(1).strip() if m else None
+
+
+async def _post_task_callback(
+    declaration_id: str,
+    success: bool,
+    final_text: str | None,
+) -> None:
+    backend_url = os.environ.get("BACKEND_URL", "http://localhost:3001").rstrip("/")
+    payload = {
+        "declaration_id": declaration_id,
+        "status": "submitted" if success else "failed",
+        "receipt": _parse_receipt(final_text),
+        "error": None if success else (final_text or "autonomous run failed")[:500],
+    }
+    async with httpx.AsyncClient(timeout=15, headers=_backend_auth_headers()) as client:
+        await client.post(f"{backend_url}/agent/task-callback", json=payload)
 
 
 if __name__ == "__main__":
