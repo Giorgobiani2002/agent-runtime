@@ -77,6 +77,24 @@ def _require_secret(provided: Optional[str]) -> None:
         raise HTTPException(status_code=403, detail="Invalid X-Internal-Secret")
 
 
+async def _reap(key: str, proc: "asyncio.subprocess.Process") -> None:
+    """Await a worker subprocess and remove its pid from LIVE_WORKERS when
+    it exits. Without this the dict only shrinks on /stop, so naturally
+    finishing (or crashing) workers accumulate forever → slow memory leak
+    on a long-lived container."""
+    try:
+        await proc.wait()
+    finally:
+        pids = LIVE_WORKERS.get(key)
+        if pids is not None:
+            try:
+                pids.remove(proc.pid)
+            except ValueError:
+                pass
+            if not pids:
+                LIVE_WORKERS.pop(key, None)
+
+
 class RunRequest(BaseModel):
     bulk_run_id: str = Field(..., min_length=1)
     company_id: Optional[str] = None
@@ -128,10 +146,10 @@ async def run(
             cwd=str(ROOT),
         )
         pids.append(proc.pid)
-        # Detach: we don't await the subprocess. agent-backend already
-        # tracks state via bulk_run_rows + recordHeartbeat — we don't
-        # need to also track here. Reaping happens via os when the
-        # process exits; on container exit Railway nukes everything.
+        # agent-backend tracks run state via bulk_run_rows + heartbeat;
+        # here we only track the pid for /workers + /stop and reap it
+        # from LIVE_WORKERS when the process exits (see _reap).
+        asyncio.create_task(_reap(payload.bulk_run_id, proc))
 
     LIVE_WORKERS.setdefault(payload.bulk_run_id, []).extend(pids)
     return RunResponse(
@@ -208,6 +226,7 @@ async def run_task(
         cwd=str(ROOT),
     )
     LIVE_WORKERS.setdefault(correlation_id, []).append(proc.pid)
+    asyncio.create_task(_reap(correlation_id, proc))
     return TaskResponse(correlation_id=correlation_id, spawned_pids=[proc.pid])
 
 
