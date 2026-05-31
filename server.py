@@ -22,11 +22,13 @@ Not exposed publicly — agent-backend is the only caller.
 """
 
 import asyncio
+import json
 import os
 import signal
 import sys
+import uuid as _uuid
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 from fastapi import FastAPI, HTTPException, Header
 from pydantic import BaseModel, Field
@@ -137,6 +139,76 @@ async def run(
         spawned_pids=pids,
         company_id=payload.company_id,
     )
+
+
+class TaskRequest(BaseModel):
+    """Autonomous (free-mode) browser-agent invocation. No pre-recorded
+    playbook required — browser-use's LLM loop drives Chromium step by
+    step from the task description + data.
+
+    Used as the fallback path when agent-backend's dispatch lookup
+    finds no playbook with the requested key.
+    """
+
+    task: str = Field(..., min_length=10)
+    data: Dict[str, Any] = Field(default_factory=dict)
+    company_id: Optional[str] = None
+    # Optional correlation id so agent-backend can match the worker
+    # output back to a declaration / approval queue row. We don't
+    # interpret it here — just forward via env so main.py picks it up.
+    correlation_id: Optional[str] = None
+    max_steps: Optional[int] = Field(None, ge=1, le=200)
+    safety_mode: Optional[str] = Field(default="halt-on-dangerous")
+
+
+class TaskResponse(BaseModel):
+    correlation_id: str
+    spawned_pids: List[int]
+
+
+@app.post("/run-task", response_model=TaskResponse, status_code=202)
+async def run_task(
+    payload: TaskRequest,
+    x_internal_secret: Optional[str] = Header(default=None, alias="X-Internal-Secret"),
+):
+    """Spawn a worker in autonomous browser-use mode (no playbook).
+
+    main.py supports --task / --data CLI args; we just hand those off.
+    The worker logs to stdout; agent-backend correlates results via
+    the correlation_id we stash in the AGENT_CORRELATION_ID env var.
+    """
+    _require_secret(x_internal_secret)
+
+    correlation_id = payload.correlation_id or f"task-{_uuid.uuid4()}"
+
+    env = os.environ.copy()
+    if payload.company_id:
+        env["AGENT_COMPANY_ID"] = payload.company_id
+    env["AGENT_CORRELATION_ID"] = correlation_id
+    env.setdefault("AGENT_HEADLESS", "true")
+
+    args: List[str] = [
+        PYTHON_BIN,
+        MAIN_PY,
+        "--task",
+        payload.task,
+        "--data",
+        json.dumps(payload.data),
+    ]
+    if payload.max_steps:
+        args.extend(["--max-steps", str(payload.max_steps)])
+    if payload.safety_mode:
+        args.extend(["--safety-mode", payload.safety_mode])
+
+    proc = await asyncio.create_subprocess_exec(
+        *args,
+        env=env,
+        stdout=asyncio.subprocess.DEVNULL,
+        stderr=asyncio.subprocess.DEVNULL,
+        cwd=str(ROOT),
+    )
+    LIVE_WORKERS.setdefault(correlation_id, []).append(proc.pid)
+    return TaskResponse(correlation_id=correlation_id, spawned_pids=[proc.pid])
 
 
 @app.post("/stop", status_code=200)
