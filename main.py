@@ -6318,12 +6318,20 @@ def main():
     # status flips without polling. Best-effort — never change the exit
     # code over a callback failure.
     correlation_id = os.environ.get("AGENT_CORRELATION_ID", "").strip()
-    declaration_id = str(user_data.get("declaration_id") or "").strip()
-    if correlation_id and declaration_id:
+    # Generic submission routing: agent-backend stuffs source_id/type +
+    # result_path into the task data so we can report back to the right
+    # endpoint (VAT declaration, payroll run, …). declaration_id stays a
+    # legacy fallback.
+    source_id = str(
+        user_data.get("source_id") or user_data.get("declaration_id") or ""
+    ).strip()
+    result_path = str(user_data.get("result_path") or "").strip()
+    if correlation_id and source_id:
         try:
             asyncio.run(
                 _post_task_callback(
-                    declaration_id=declaration_id,
+                    source_id=source_id,
+                    result_path=result_path,
                     success=success,
                     final_text=_LAST_FINAL_RESULT,
                 )
@@ -6346,13 +6354,15 @@ def _parse_receipt(final_text: str | None) -> str | None:
 
 
 async def _post_task_callback(
-    declaration_id: str,
+    source_id: str,
+    result_path: str,
     success: bool,
     final_text: str | None,
 ) -> None:
     backend_url = os.environ.get("BACKEND_URL", "http://localhost:3001").rstrip("/")
     payload = {
-        "declaration_id": declaration_id,
+        "source_id": source_id,
+        "result_path": result_path or None,
         "status": "submitted" if success else "failed",
         "receipt": _parse_receipt(final_text),
         "error": None if success else (final_text or "autonomous run failed")[:500],
