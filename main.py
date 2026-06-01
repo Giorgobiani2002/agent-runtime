@@ -41,10 +41,17 @@ os.environ.setdefault("BROWSER_USE_CONFIG_DIR", str(_agent_dir / "recordings" / 
 COMPLETION_READY_FOR_REVIEW = "ready_for_review"
 COMPLETION_SUBMITTED = "submitted"
 COMPLETION_FAILED = "failed"
+# "needs_review" = the submit action fired and the deterministic checks
+# (K1 typed-values + DOM postcondition) passed, but the visual validator could
+# not positively recognise a confirmation page. The data almost certainly
+# reached rs.ge — so this is NOT a failure; it is a submitted-but-unconfirmed
+# outcome flagged for a human to glance at, instead of a false red "Failed".
+COMPLETION_NEEDS_REVIEW = "needs_review"
 COMPLETION_STATES = {
     COMPLETION_READY_FOR_REVIEW,
     COMPLETION_SUBMITTED,
     COMPLETION_FAILED,
+    COMPLETION_NEEDS_REVIEW,
 }
 SAFETY_MODES = {"auto", "halt-on-dangerous", "dry-run"}
 AGENT_MODES = {"free", "playbook", "bulk"}
@@ -4773,24 +4780,45 @@ async def run_bulk(run_id: str):
                                                     workaround="Click the field, press Ctrl+A, then re-type.",
                                                 ))
                                     elif not _ok:
-                                        _emit("warn",
-                                              f"Row {row['row_index']}: ⚠ Visual validator: "
-                                              f"not a confirmation page. ({_vr.get('explanation', '')[:120]})")
-                                        result["status"] = "failed"
-                                        result["completionState"] = COMPLETION_FAILED
-                                        result["error"] = (
-                                            _verr or (
-                                                f"Visual validator: not a confirmation page. "
-                                                f"{_vr.get('explanation', '')[:120]}"
+                                        # The submit fired and the deterministic gates (K1 typed
+                                        # values + DOM postcondition) already passed; only the
+                                        # screenshot heuristic is unsure. In real-submission
+                                        # ("auto") mode the data has almost certainly reached
+                                        # rs.ge, so DON'T raise a false "failed" — record it as
+                                        # submitted-but-unconfirmed and flag it for a quick human
+                                        # check. (In halt/dry-run modes a non-confirmation screen
+                                        # is still a real stop, so keep the failure there.)
+                                        if safety_mode == "auto":
+                                            _emit("warn",
+                                                  f"Row {row['row_index']}: ⚠ couldn't visually confirm the "
+                                                  f"confirmation page, but typed values + DOM checks passed — "
+                                                  f"marking SUBMITTED (needs verification), not failed.")
+                                            result["status"] = "success"
+                                            result["completionState"] = COMPLETION_NEEDS_REVIEW
+                                            result["needsVerification"] = True
+                                            result["verificationNote"] = (
+                                                "Submitted, but the confirmation page could not be visually "
+                                                f"verified — please double-check on rs.ge. {_vr.get('explanation', '')[:120]}"
                                             )
-                                        )
-                                        if _row_portal:
-                                            asyncio.create_task(report_failure_pattern(
-                                                domain=_row_portal,
-                                                failure_type="m1_not_confirmation",
-                                                symptom=f"Not a confirmation page after run. {_vr.get('explanation','')[:300]}",
-                                                workaround="Verify the submit/finalise step actually fired; check for stuck loading spinner or popup.",
-                                            ))
+                                        else:
+                                            _emit("warn",
+                                                  f"Row {row['row_index']}: ⚠ Visual validator: "
+                                                  f"not a confirmation page. ({_vr.get('explanation', '')[:120]})")
+                                            result["status"] = "failed"
+                                            result["completionState"] = COMPLETION_FAILED
+                                            result["error"] = (
+                                                _verr or (
+                                                    f"Visual validator: not a confirmation page. "
+                                                    f"{_vr.get('explanation', '')[:120]}"
+                                                )
+                                            )
+                                            if _row_portal:
+                                                asyncio.create_task(report_failure_pattern(
+                                                    domain=_row_portal,
+                                                    failure_type="m1_not_confirmation",
+                                                    symptom=f"Not a confirmation page after run. {_vr.get('explanation','')[:300]}",
+                                                    workaround="Verify the submit/finalise step actually fired; check for stuck loading spinner or popup.",
+                                                ))
                                     else:
                                         _emit("info", f"Row {row['row_index']}: visual validator accepted ({_completion_state}).")
                                 except Exception as _ve:
