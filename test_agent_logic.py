@@ -187,6 +187,62 @@ class AgentLogicTests(unittest.TestCase):
         self.assertEqual(len(missing), 1)
         self.assertEqual(missing[0]["key"], "note")
 
+    def test_lines_become_row_groups_not_scalar_items(self):
+        contract = main._build_authoritative_data_contract(
+            {
+                "period_year": 2026,
+                "period_month": 5,
+                "lines": [
+                    {"personal_id": "01001000001", "name": "A", "gross": 1000, "income_tax": 196},
+                    {"personal_id": "02002000002", "name": "B", "gross": 2000, "income_tax": 400},
+                ],
+            },
+            {},
+            "Fill rs.ge payroll declaration",
+        )
+        # The array is pulled out as a row group, not a junk scalar item.
+        self.assertEqual(contract["summary"]["row_groups"], 1)
+        self.assertEqual(contract["summary"]["rows"], 2)
+        self.assertNotIn("lines", [it["key"] for it in contract["items"]])
+        # The rendered block instructs one-by-one entry and lists both ids.
+        block = main._format_authoritative_data_block(contract)
+        self.assertIn("ROWS TO ENTER ONE-BY-ONE", block)
+        self.assertIn("01001000001", block)
+        self.assertIn("02002000002", block)
+
+    def test_row_coverage_flags_employee_whose_id_was_never_typed(self):
+        contract = main._build_authoritative_data_contract(
+            {"lines": [
+                {"personal_id": "01001000001", "name": "A", "income_tax": 196},
+                {"personal_id": "02002000002", "name": "B", "income_tax": 400},
+            ]},
+            {},
+            "payroll",
+        )
+        # Agent only typed the first employee's id → the second is missing.
+        history = _History([
+            _Action({"input_text": {"text": "01001000001"}}),
+            _Action({"input_text": {"text": "196"}}),
+        ])
+        missing = main._check_row_coverage(history, contract)
+        self.assertEqual(len(missing), 1)
+        self.assertIn("02002000002", missing[0]["label"])
+
+    def test_row_coverage_passes_when_all_ids_typed(self):
+        contract = main._build_authoritative_data_contract(
+            {"lines": [
+                {"personal_id": "01001000001", "name": "A"},
+                {"personal_id": "02002000002", "name": "B"},
+            ]},
+            {},
+            "payroll",
+        )
+        history = _History([
+            _Action({"input_text": {"text": "01001000001"}}),
+            _Action({"input_text": {"text": "02002000002"}}),
+        ])
+        self.assertEqual(main._check_row_coverage(history, contract), [])
+
 
 class _ActorPage:
     def __init__(self, url="https://decl.rs.ge/decls.aspx", actor_element=None):

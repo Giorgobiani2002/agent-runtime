@@ -1053,6 +1053,39 @@ def _check_authoritative_contract_coverage(history, contract: dict) -> list[dict
     return missing
 
 
+def _check_row_coverage(history, contract: dict) -> list[dict]:
+    """Anti-hallucination gate for tabular row data (payroll employees).
+
+    Every employee's personal_id is UNIQUE, so requiring each one to appear in
+    what the agent actually typed makes it impossible to fake "done" while
+    skipping a person — if employee X's id was never typed, X wasn't entered.
+    Returns the rows whose identifier never showed up in the typed history.
+    """
+    row_groups = contract.get("row_groups") or []
+    if not row_groups:
+        return []
+    typed_blob = _typed_blob_from_history(history).lower()
+    id_keys = ("personal_id", "pid", "tin", "id_number", "personal_number")
+    missing: list[dict] = []
+    for group in row_groups:
+        for idx, row in enumerate(group.get("rows") or [], 1):
+            id_val = ""
+            for k in id_keys:
+                v = row.get(k)
+                if v not in (None, ""):
+                    id_val = str(v).strip()
+                    break
+            label = id_val or str(row.get("name") or f"row {idx}")
+            # If we have no identifier to check against, we can't verify this
+            # row deterministically — flag it so it's never a silent success.
+            if not id_val:
+                missing.append({"row": idx, "label": label, "reason": "row has no identifier to verify"})
+                continue
+            if id_val.lower() not in typed_blob:
+                missing.append({"row": idx, "label": label, "reason": "employee identifier never typed — row not entered"})
+    return missing
+
+
 def _check_required_contract_items_verified(contract: dict, typed_log, dom_review: dict | None) -> list[dict]:
     dom_entries = (dom_review or {}).get("fields") or []
     missing: list[dict] = []
@@ -1436,6 +1469,11 @@ def _build_authoritative_data_contract(
 ) -> dict:
     field_map = field_map or {}
     items: list[dict] = []
+    # Tabular values (e.g. payroll `lines`: a list of per-employee dicts) are
+    # NOT scalar form fields — they describe N rows to enter one-by-one. Pull
+    # them out so they don't pollute the scalar contract, and surface them as
+    # a dedicated "rows to enter" block the agent loops over.
+    row_groups: list[dict] = []
     required_count = 0
     optional_count = 0
     zero_like_count = 0
@@ -1444,6 +1482,9 @@ def _build_authoritative_data_contract(
     task_lower = (task_hint or "").lower()
     form_like_task = any(token in task_lower for token in ("fill", "submit", "declaration", "tax", "rs.ge", "ფორმ"))
     for raw_key, raw_value in (user_data or {}).items():
+        if isinstance(raw_value, list) and raw_value and all(isinstance(r, dict) for r in raw_value):
+            row_groups.append({"key": str(raw_key), "rows": raw_value})
+            continue
         key = str(raw_key)
         value = "" if raw_value is None else str(raw_value).strip()
         is_sensitive = bool(_CREDENTIAL_KEY_RE.search(key))
@@ -1499,6 +1540,7 @@ def _build_authoritative_data_contract(
 
     return {
         "items": items,
+        "row_groups": row_groups,
         "summary": {
             "total": len(items),
             "required": required_count,
@@ -1507,8 +1549,39 @@ def _build_authoritative_data_contract(
             "mapped": mapped_count,
             "unmapped": max(0, len(items) - mapped_count),
             "sensitive": sensitive_count,
+            "row_groups": len(row_groups),
+            "rows": sum(len(g.get("rows") or []) for g in row_groups),
         },
     }
+
+
+def _format_row_groups_block(contract: dict) -> str:
+    """Render tabular row data (e.g. payroll employees) as an explicit
+    one-by-one entry instruction. Empty when there are no row groups, so
+    scalar-only (VAT) runs are unaffected."""
+    row_groups = contract.get("row_groups") or []
+    out: list[str] = []
+    # Keys that are bookkeeping, not values to type per row.
+    skip = {"employee_id", "pension_participant"}
+    for group in row_groups:
+        rows = group.get("rows") or []
+        if not rows:
+            continue
+        out.append(f"=== ROWS TO ENTER ONE-BY-ONE — {len(rows)} ({group.get('key')}) ===")
+        out.append(
+            "For EACH row below, repeat the per-row sub-flow (add a new line / "
+            "person and fill its fields). Enter EVERY row — do not skip or stop "
+            "early. After ALL rows are entered, submit the declaration ONCE."
+        )
+        for idx, row in enumerate(rows, 1):
+            parts = []
+            for k, v in row.items():
+                if k in skip or v is None or str(v).strip() == "":
+                    continue
+                parts.append(f"{k}={v}")
+            out.append(f"  Row {idx}: " + ", ".join(parts))
+        out.append("=== END ROWS ===")
+    return "\n".join(out)
 
 
 def _required_contract_items(contract: dict) -> list[dict]:
@@ -1517,8 +1590,10 @@ def _required_contract_items(contract: dict) -> list[dict]:
 
 def _format_authoritative_data_block(contract: dict) -> str:
     items = contract.get("items") or []
+    rows_block = _format_row_groups_block(contract)
     if not items:
-        return ""
+        # Scalar-free but may still have rows to enter (rare).
+        return rows_block
 
     required = [item for item in items if item.get("required_for_fill") and not item.get("is_sensitive")]
     sensitive_required = [item for item in items if item.get("required_for_fill") and item.get("is_sensitive")]
@@ -1549,6 +1624,8 @@ def _format_authoritative_data_block(contract: dict) -> str:
         if len(optional) > 20:
             lines.append(f"  ... and {len(optional) - 20} more optional/ignored value(s)")
     lines.append("=== END AUTHORITATIVE SPREADSHEET DATA ===")
+    if rows_block:
+        lines.append(rows_block)
     return "\n".join(lines)
 
 
@@ -1567,6 +1644,11 @@ def _format_authoritative_data_summary(contract: dict, *, max_items: int = 8) ->
         lines.append(f'  {item["key"]}{label} -> {item["display_value"]}')
     if len(required) > max_items:
         lines.append(f"  ... and {len(required) - max_items} more required value(s)")
+    if summary.get("rows"):
+        lines.append(
+            f"PLUS {summary.get('rows')} row(s) to enter ONE-BY-ONE (see ROWS TO ENTER "
+            f"block) — repeat the per-row sub-flow for each, then submit once."
+        )
     lines.append("Spreadsheet contract outranks site memory and KB heuristics.")
     lines.append("If knowledge or memory conflicts with spreadsheet values, keep the spreadsheet value and report the conflict.")
     lines.append("=== END AUTHORITATIVE DATA SUMMARY ===")
@@ -4719,6 +4801,34 @@ async def run_bulk(run_id: str):
                                         failure_type="k1_hallucination",
                                         symptom=f"Agent claimed success but never typed required spreadsheet fields: [{_preview}{_more}]",
                                         workaround="Use the authoritative spreadsheet block and verify every required field before success.",
+                                    ))
+
+                        # K1-rows: every tabular row (e.g. each payroll employee)
+                        # must have its UNIQUE identifier in the typed history.
+                        # Catches "agent submitted but skipped/hallucinated some
+                        # employees" — the exact hallucination we must exclude.
+                        if result["status"] == "success":
+                            _rows_missing = _check_row_coverage(history, _row_contract)
+                            if _rows_missing:
+                                _rpreview = ", ".join(str(v.get("label")) for v in _rows_missing[:8])
+                                _rmore = f" (+{len(_rows_missing) - 8} more)" if len(_rows_missing) > 8 else ""
+                                _emit(
+                                    "warn",
+                                    f"Row {row['row_index']}: ⚠ Incomplete — {len(_rows_missing)} employee row(s) "
+                                    f"never entered: [{_rpreview}{_rmore}]",
+                                )
+                                result["status"] = "failed"
+                                result["completionState"] = COMPLETION_FAILED
+                                result["error"] = (
+                                    f"K1-rows: {len(_rows_missing)} employee row(s) not entered/verified: "
+                                    f"[{_rpreview}{_rmore}]"
+                                )
+                                if _row_portal:
+                                    asyncio.create_task(report_failure_pattern(
+                                        domain=_row_portal,
+                                        failure_type="k1_rows_incomplete",
+                                        symptom=f"Declaration submitted/attempted but {len(_rows_missing)} employee row(s) were never entered: [{_rpreview}{_rmore}]",
+                                        workaround="Enter EVERY employee row from the ROWS TO ENTER block; verify each personal_id is typed before submitting.",
                                     ))
 
                         if result["status"] == "success":
