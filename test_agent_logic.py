@@ -2,6 +2,8 @@ import unittest
 from types import SimpleNamespace
 from pathlib import Path
 import sys
+import os
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).parent))
 
@@ -33,6 +35,55 @@ class _History:
 
 
 class AgentLogicTests(unittest.TestCase):
+    def test_runtime_llm_prefers_gemini_api_key(self):
+        old_key = os.environ.get("GEMINI_API_KEY")
+        try:
+            os.environ["GEMINI_API_KEY"] = "test-key"
+            with patch("browser_use.llm.google.chat.ChatGoogle") as chat_google:
+                main._chat_google_vertex("gemini-3.5-flash")
+
+            chat_google.assert_called_once_with(
+                model="gemini-3.5-flash",
+                api_key="test-key",
+                temperature=0,
+            )
+        finally:
+            if old_key is None:
+                os.environ.pop("GEMINI_API_KEY", None)
+            else:
+                os.environ["GEMINI_API_KEY"] = old_key
+
+    def test_runtime_llm_falls_back_to_vertex_when_api_key_missing(self):
+        old_key = os.environ.get("GEMINI_API_KEY")
+        old_project = os.environ.get("GCP_PROJECT_ID")
+        old_location = os.environ.get("GCP_LOCATION")
+        try:
+            os.environ.pop("GEMINI_API_KEY", None)
+            os.environ["GCP_PROJECT_ID"] = "gen-lang-client-0355771224"
+            os.environ["GCP_LOCATION"] = "global"
+            with patch("browser_use.llm.google.chat.ChatGoogle") as chat_google:
+                main._chat_google_vertex("gemini-3.5-flash")
+
+            chat_google.assert_called_once()
+            kwargs = chat_google.call_args.kwargs
+            self.assertEqual(kwargs["model"], "gemini-3.5-flash")
+            self.assertTrue(kwargs["vertexai"])
+            self.assertEqual(kwargs["project"], "gen-lang-client-0355771224")
+            self.assertEqual(kwargs["location"], "global")
+        finally:
+            if old_key is None:
+                os.environ.pop("GEMINI_API_KEY", None)
+            else:
+                os.environ["GEMINI_API_KEY"] = old_key
+            if old_project is None:
+                os.environ.pop("GCP_PROJECT_ID", None)
+            else:
+                os.environ["GCP_PROJECT_ID"] = old_project
+            if old_location is None:
+                os.environ.pop("GCP_LOCATION", None)
+            else:
+                os.environ["GCP_LOCATION"] = old_location
+
     def test_authoritative_contract_classifies_required_optional_and_sensitive(self):
         contract = main._build_authoritative_data_contract(
             {

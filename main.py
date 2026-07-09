@@ -24,6 +24,7 @@ import uuid
 from pathlib import Path
 from datetime import datetime
 from decimal import Decimal, InvalidOperation
+from functools import lru_cache
 
 # Ensure UTF-8 stdout so we can emit non-ASCII safely on Windows when spawned as subprocess
 try:
@@ -119,30 +120,83 @@ async def _close_http():
 # ── LLM setup ─────────────────────────────────────────────────────────────────
 # browser-use 0.12.x uses its own native LLM wrappers (not LangChain).
 
+def _vertex_project() -> str:
+    return os.environ.get("GCP_PROJECT_ID", "gen-lang-client-0355771224")
+
+
+def _vertex_location() -> str:
+    return os.environ.get("GCP_LOCATION", "global")
+
+
+def _gemini_api_key() -> str | None:
+    value = os.environ.get("GEMINI_API_KEY", "").strip()
+    return value or None
+
+
+@lru_cache(maxsize=1)
+def _vertex_credentials():
+    raw = os.environ.get("GCP_SERVICE_ACCOUNT_JSON", "").strip()
+    if not raw:
+        return None
+
+    from google.oauth2 import service_account
+
+    return service_account.Credentials.from_service_account_info(
+        json.loads(raw),
+        scopes=["https://www.googleapis.com/auth/cloud-platform"],
+    )
+
+
+def _genai_vertex_client():
+    from google import genai
+
+    api_key = _gemini_api_key()
+    if api_key:
+        return genai.Client(api_key=api_key)
+
+    return genai.Client(
+        vertexai=True,
+        project=_vertex_project(),
+        location=_vertex_location(),
+        credentials=_vertex_credentials(),
+    )
+
+
+def _chat_google_vertex(model_name: str):
+    from browser_use.llm.google.chat import ChatGoogle
+
+    api_key = _gemini_api_key()
+    if api_key:
+        return ChatGoogle(
+            model=model_name,
+            api_key=api_key,
+            temperature=0,
+        )
+
+    return ChatGoogle(
+        model=model_name,
+        vertexai=True,
+        project=_vertex_project(),
+        location=_vertex_location(),
+        credentials=_vertex_credentials(),
+        temperature=0,
+    )
+
+
 def build_llm():
     """Build the worker LLM (used for per-step actions inside browser-use's loop)."""
-    from browser_use.llm.google.chat import ChatGoogle
     # gemini-3.1-flash-lite: latest fast Gemini, no extended thinking so it
     # never hits MAX_TOKENS mid-response. Note: there is NO plain
     # "gemini-3.1-flash" in the API — only -flash-lite or -pro-preview.
     # Override with AGENT_MODEL env var (e.g. gemini-3.1-pro-preview for harder tasks).
-    model_name = os.environ.get("AGENT_MODEL", "gemini-3.1-flash-lite")
-    return ChatGoogle(
-        model=model_name,
-        api_key=os.environ["GEMINI_API_KEY"],
-        temperature=0,
-    )
+    model_name = os.environ.get("AGENT_MODEL", "gemini-3.1-flash-lite-preview")
+    return _chat_google_vertex(model_name)
 
 
 def build_planner_llm():
     """Build the planner LLM (used for pre-pass + periodic re-planning)."""
-    from browser_use.llm.google.chat import ChatGoogle
     model_name = os.environ.get("PLANNER_MODEL", "gemini-3.1-pro-preview")
-    return ChatGoogle(
-        model=model_name,
-        api_key=os.environ["GEMINI_API_KEY"],
-        temperature=0,
-    )
+    return _chat_google_vertex(model_name)
 
 
 async def _capture_action_history(
@@ -431,10 +485,6 @@ async def _locate_element_with_llm(page, act: dict):
         from google import genai as _genai
         from google.genai import types as _gtypes
 
-        api_key = os.environ.get("GEMINI_API_KEY")
-        if not api_key:
-            return None, None
-
         ax_name = act.get("ax_name") or ""
         node_name = act.get("node_name") or ""
         attrs = act.get("attributes") or {}
@@ -472,9 +522,14 @@ Rules:
 - If the element is not visible on the page, return null
 - Reply ONLY as JSON: {{"selector": "...", "found": true}} or {{"selector": null, "found": false}}"""
 
-        client = _genai.Client(api_key=api_key)
+        client = _genai_vertex_client()
         response = client.models.generate_content(
-            model=os.environ.get("LOCATOR_MODEL", "gemini-2.0-flash-lite"),
+            model=(
+                os.environ.get("LOCATOR_MODEL")
+                or os.environ.get("AGENT_MODEL")
+                or os.environ.get("GEMINI_CHAT_MODEL")
+                or "gemini-3.5-flash"
+            ),
             contents=[
                 _gtypes.Part.from_bytes(data=screenshot, mime_type="image/png"),
                 prompt,
@@ -2137,7 +2192,7 @@ Look at this screenshot and answer these questions:
 Reply ONLY as JSON (no markdown fences):
 {{"is_confirmation_page": false, "is_ready_for_review": true, "final_action_visible": true, "irreversible_action_executed": false, "suspicious_zero_fields": [], "reg_number": null, "explanation": "one sentence"}}"""
 
-        client = _genai.Client(api_key=os.environ["GEMINI_API_KEY"])
+        client = _genai_vertex_client()
         response = client.models.generate_content(
             model=os.environ.get("VALIDATOR_MODEL", "gemini-3.1-flash-lite"),
             contents=[
@@ -2227,7 +2282,7 @@ Reply ONLY as a JSON array (no markdown fences):
 [{"label_ge": "...", "label_en": "...", "type": "number", "css_hint": "...", "page_section": "..."}]
 """
 
-        client = _genai.Client(api_key=os.environ["GEMINI_API_KEY"])
+        client = _genai_vertex_client()
         response = client.models.generate_content(
             model=os.environ.get("VALIDATOR_MODEL", "gemini-3.1-flash-lite"),
             contents=[
@@ -2310,7 +2365,7 @@ Reply ONLY as a JSON array (no markdown fences):
 [{{"label_ge": "...", "label_en": "...", "kind": "sidebar", "parent_label": null, "hint": "..."}}]
 """
 
-        client = _genai.Client(api_key=os.environ["GEMINI_API_KEY"])
+        client = _genai_vertex_client()
         response = client.models.generate_content(
             model=os.environ.get("VALIDATOR_MODEL", "gemini-3.1-flash-lite"),
             contents=[
@@ -5804,12 +5859,7 @@ async def run_agent(
             try:
                 if not escalation_state["active"] and cf >= 2:
                     if escalation_state["stronger_llm"] is None:
-                        from browser_use.llm.google.chat import ChatGoogle
-                        escalation_state["stronger_llm"] = ChatGoogle(
-                            model=escalation_model,
-                            api_key=os.environ["GEMINI_API_KEY"],
-                            temperature=0,
-                        )
+                        escalation_state["stronger_llm"] = _chat_google_vertex(escalation_model)
                     escalation_state["original_llm"] = ag.llm
                     ag.llm = escalation_state["stronger_llm"]
                     escalation_state["active"] = True
